@@ -1,50 +1,71 @@
 # Local development
 
-Node.js 22 or newer is required (`package.json` `engines`). The production image uses Node 24.
+You do not need this page to deploy the website or to connect Okta. Use it when you are changing the code on a Windows PC.
 
-```bash
-npm install
-cp .env.example .env
-# set SCIM_TOKEN and SESSION_SECRET at least
-npm start
+The production container uses Node 24. Your PC needs Node.js 22 or newer. The Windows installer is on [https://nodejs.org](https://nodejs.org). Leave **Add to PATH** checked. Close and reopen PowerShell after installing.
+
+## Run the website on your PC
+
+1. Open PowerShell.
+2. Go to the project folder:
+
+```powershell
+cd C:\path\to\okta-test-app
 ```
 
-`npm start` runs `node src/server.js`. To load `.env` the way the README historically did:
+3. Install the libraries once:
 
-```bash
+```powershell
+npm install
+```
+
+4. Copy the sample settings:
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+5. In Notepad, set `SCIM_TOKEN` and `SESSION_SECRET`. You can generate a value in PowerShell:
+
+```powershell
+-join ((1..32 | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) }))
+```
+
+Paste a different value into each of those two lines. Save the file.
+
+6. Start the site:
+
+```powershell
 node --env-file=.env src/server.js
 ```
 
-The app listens on port 8080 unless `PORT` is set. Open `http://localhost:8080`. Until `SAML_IDP_METADATA_URL` (or the manual SSO URL and certificate) is valid, the home page reports that SAML is not ready and `/login` returns 503. SCIM returns 503 until `SCIM_TOKEN` is set.
+7. Open [http://localhost:8080](http://localhost:8080).
 
-## Tests
+Until `SAML_IDP_METADATA_URL` in `.env` is a real Okta metadata URL, the home page says SAML is not ready and `/login` returns **SAML not configured**. That is expected. `/scim/v2` returns 503 until `SCIM_TOKEN` is set.
 
-```bash
+Stop the site with Ctrl+C in that PowerShell window.
+
+## What you can and cannot test from localhost
+
+Okta's sign-in form in a real org expects the Single sign-on URL to be an `https://` address Okta can name. Day-to-day sign-in testing belongs on the AWS address from [Deploy on AWS](aws.md).
+
+User sync is called by Okta's servers. Okta cannot reach `http://localhost:8080`. Point the Okta SCIM base URL at the deployed website.
+
+A tunnel such as ngrok can publish your PC if you set `BASE_URL` in `.env` to the tunnel's `https://` address and use that same address in the Okta app. Restart `node` after you change `.env`. The AWS website is the simpler place to test.
+
+## Run the tests
+
+From the project folder:
+
+```powershell
 npm test
 ```
 
-`test/app.test.js` starts the server against a throwaway data directory and a fixture IdP certificate. It checks:
+The tests start the program against a temporary data folder and a fake Okta certificate that lives in `test\fixtures`. They check the metadata page, the redirect to a fake sign-in URL, rejection of a bad SCIM token, rejection of an unknown user when synced users are required, the user create/update calls Okta makes, a successful sign-in, rejection of a tampered message, group membership, and deactivation.
 
-- SP metadata contains the entity ID and ACS URL
-- `/login` redirects to the fixture SSO URL with a `SAMLRequest`
-- SCIM rejects a bad bearer token
-- With `REQUIRE_SCIM_USER=true`, an unknown user is denied
-- The user create, filter, PUT, and PATCH sequence Okta sends
-- A provisioned user can complete IdP-initiated and SP-initiated logins
-- A tampered assertion is rejected
-- Group member add/remove and user deactivation
-- Parsing an Okta-style IdP metadata document
+The certificate in `test\fixtures` is only for that test. Do not paste it into Okta or into `.env`.
 
-The fixture key and certificate under `test/fixtures/` exist only for this test. Do not use them as a real IdP.
+## Local data
 
-## What you can exercise on localhost
-
-SAML ACS is a browser POST to the URL configured in Okta. A local server can receive that POST. Okta's Single sign-on URL field expects an `https://` URL on a real org, so day-to-day SSO testing belongs on the deployed origin.
-
-SCIM is called by Okta's servers, not by the browser. Okta cannot reach `http://localhost:8080`. Point provisioning at the deployed base URL.
-
-A tunnel (ngrok, Cloudflare Tunnel, or similar) works if you set `BASE_URL` to the public `https://` origin and use that same origin in the Okta app. Restart the process after changing `BASE_URL` or the metadata URL.
-
-## Data
-
-Local runs write `./data/db.json` (gitignored). Delete that file to wipe users, groups, and logs.
+Runs on your PC write `data\db.json`. That folder is not part of git. Delete the file to clear local users, groups, and logs.
