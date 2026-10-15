@@ -1,0 +1,24 @@
+{
+  "name": "okta-test-app",
+  "version": "1.0.0",
+  "description": "Minimal SAML 2.0 service provider with SCIM 2.0 provisioning, for testing Okta authentication policies",
+  "main": "src/server.js",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@node-saml/node-saml": "^5.1.0",
+    "@xmldom/xmldom": "^0.9.12",
+    "express": "^4.22.3",
+    "express-session": "^1.19.0"
+  },
+  "devDependencies": {
+    "xml-crypto": "^6.3.3"
+  }
+}
