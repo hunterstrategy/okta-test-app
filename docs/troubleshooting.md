@@ -1,95 +1,165 @@
 # Troubleshooting
 
-## Health and startup
+Match the sentence you see, then do the steps under it. The deploy commands assume Git Bash is open in the project folder. In File Explorer, right-click the folder background and click **Git Bash Here**. On Windows 11, choose **Show more options** first if you do not see that item. PowerShell commands are marked as PowerShell.
 
-`curl https://<app-url>/healthz` returns `{"ok":true,"saml":false}`.
+The website address below means the `https://....cs.amazonlightsail.com` address from the deploy script, with no path on the end.
 
-SAML did not initialize. The process is still up, which is why the load balancer marks it healthy. Read the container log for the `[saml]` line.
+## The browser
 
-- `SAML is not configured` — `SAML_IDP_METADATA_URL` was empty at startup. Redeploy with the metadata URL.
-- `Fetching IdP metadata failed: HTTP ...` — the URL is wrong, Okta returned an error, or the task has no outbound HTTPS. Copy the metadata URL again from the app's **Sign On** tab.
-- `IdP metadata has no EntityDescriptor` / `no signing certificate` — the URL did not return Okta metadata. Browsing to it should show XML with `EntityDescriptor`.
+### `/healthz` shows `{"ok":true,"saml":false}`
 
-After a successful load the log contains `[saml] ready. IdP SSO URL: ...` and health returns `"saml":true`. Changing the metadata URL has no effect until the process starts again.
+The website process is up. It does not have Okta's settings yet, or it failed to download them.
 
-`[config] SESSION_SECRET not set` means sessions will die on the next restart. On Lightsail, confirm `.deploy.env` contains `SESSION_SECRET` and redeploy.
+1. If you have not copied Okta's Metadata URL and redeployed, this is expected. Continue at [Give the website Okta's address](aws.md#give-the-website-oktas-address).
+2. If you already redeployed, wait until this PowerShell command prints `RUNNING`. A deploy still in progress is serving the old copy.
 
-## SAML login
+```powershell
+aws lightsail get-container-services --service-name okta-test-app --query "containerServices[0].state" --output text
+```
 
-**503 SAML not configured** on `/login`. Same causes as `"saml":false` above.
+3. If it is `RUNNING` and `saml` is still false, read the log. In PowerShell:
 
-**Okta says the app is unavailable, or "A SAML response was received unexpectedly" / audience mismatch.** Compare Okta and the running app:
+```powershell
+$end = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$start = $end - 3600
+aws lightsail get-container-log --service-name okta-test-app --container-name app --start-time $start --end-time $end --query "logEvents[].message" --output text
+```
 
-- Single sign-on URL equals the `ACS URL` row on `/admin` (or `[app] ACS URL` in the log).
-- Audience URI equals the `SP Entity ID` row.
-- Both use `https://` and the host people actually open.
-- Recipient URL and Destination URL are the ACS URL (the checkbox in the SAML wizard).
+| Line in the log | What to do |
+|---|---|
+| `SAML is not configured` | `.deploy.env` has an empty `SAML_IDP_METADATA_URL`. Run the second deploy with the URL in quotes. |
+| `Fetching IdP metadata failed: HTTP` | The metadata URL is incomplete or Okta returned an error. In Okta, Sign On tab, right-click **Metadata URL**, copy the link address, and deploy again. |
+| `IdP metadata has no EntityDescriptor` or `no signing certificate` | The URL is not Okta's metadata. Open the URL in a browser. You should see XML that contains `EntityDescriptor`. |
 
-A Lightsail redeploy keeps the same service URL. Changing `BASE_URL` on ECS without editing the Okta app produces this mismatch.
+A good log contains `[saml] ready. IdP SSO URL:`. Changing the URL does nothing until the next deploy finishes and the process starts again.
 
-**401 SAML validation failed.** The page includes `node-saml`'s reason. Common ones:
+### `/healthz` does not load at all
 
-- Invalid signature. The process is still using a certificate from before an Okta cert rollover. Restart so metadata is fetched again. If you configured `SAML_IDP_CERT` by hand, paste the current signing cert.
-- Assertion audience does not match. Audience URI and `SAML_SP_ENTITY_ID` / default entity ID differ.
-- Timestamps. The app allows 60 seconds of clock skew. A task with a bad clock fails `NotBefore` / `NotOnOrAfter`.
-- `SAML_WANT_RESPONSE_SIGNED=true` while you turned response signing off in Okta, or the reverse if you set Okta to sign only the assertion and then require the response.
+1. In PowerShell, check the state command above. `DEPLOYING` means wait. `PENDING` on a brand-new service can last several minutes.
+2. Confirm you are using `https://` and the host from the script, not `http://localhost`.
+3. If the state stays `DEPLOYING` for more than about 15 minutes, read the log. The process is crashing and the health check never passes.
 
-The failed attempt is listed in `/admin` **Recent sign-ins** when the POST reached the app. Sign in as someone who can, or check the log line `[saml] rejected response`.
+### The home page says SAML not configured, or `/login` says that
 
-**403 Access denied** after Okta accepted the password or factor. The assertion was valid and `REQUIRE_SCIM_USER=true` rejected it.
+Same cause as `"saml":false`. The website has not loaded Okta's metadata.
 
-- "User has not been provisioned via SCIM" — no SCIM `userName` matches NameID or `email`. Check **SCIM users**. Confirm Okta application username and the SCIM `userName` mapping are the same value. Assign the user and confirm **Create Users** is enabled.
-- "User is deactivated in SCIM" — the user exists and `active` is false. Reassign them or turn them active in Okta so a PATCH sets `active` back to true.
+### Okta shows an error and you never reach the website
 
-**Login succeeds but the authentication policy never prompts.** The Okta session is already satisfied. Redeploy with `SAML_FORCE_AUTHN=true` and use `/login`, or use a private window and sign out of Okta first. The dashboard tile does not send `ForceAuthn`. Also confirm the app's **Sign On** tab uses the policy you edited, and that the strict rule is ordered above a broader allow rule.
+Okta rejected the sign-in, or the addresses in the Okta app do not match the running website.
 
-**The home page shows `PasswordProtectedTransport` after a FIDO2 login.** That is Okta's usual `AuthnContextClassRef`. Check System Log, and add a SAML attribute named `amr` with value `session.amr` if you want the method list on the home page. See [Okta integration](okta.md).
+1. In Okta, open the app, **Sign On**, and compare the SAML settings with the Admin page of the website (sign in first by another account if you can) or with the `[app] ACS URL` and `[app] Entity ID` lines in the log.
+2. Single sign-on URL must be the website address plus `/saml/acs`.
+3. Audience URI must be the website address plus `/saml/metadata`.
+4. The checkbox **Use this for Recipient URL and Destination URL** must be checked.
+5. Both values use `https://` and the same host you open in the browser.
 
-**`/admin` is 403.** `ADMIN_USERS` is set and neither NameID nor the `email` attribute is in the list. Attribute name `email` has to be the statement from the Okta app. NameID alone is enough when it is the email.
+A Lightsail redeploy keeps the same website address. If you change the public name (for example by moving to ECS), update both Okta fields to match.
 
-**Clicking the dashboard tile lands on `/` with IdP-initiated.** That is the expected result. SP-initiated is only `/login`.
+Then open Okta **Reports → System Log**, set the time to the last 15 minutes, and find the user you tested. The event text is the reason Okta stopped.
 
-## SCIM
+### The website says SAML validation failed (401)
 
-**Test Connector Configuration fails.**
+Okta did deliver a message, and the website rejected it. The page includes the reason. **Recent sign-ins** on `/admin` lists it too, if you can open Admin as someone else.
 
-- Base URL is `https://<app-url>/scim/v2` with no extra path and no trailing slash beyond `v2`.
-- Authentication mode is HTTP Header.
-- The Authorization box is the raw token from `.deploy.env` or Secrets Manager. A second `Bearer ` prefix will not match.
-- `/healthz` works from your machine. Okta's IPs must be able to reach the load balancer. A Lightsail service URL is public. An ALB security group that only allows your office IP will fail Okta's test.
-- Token empty in the running container: SCIM returns 503 `SCIM is disabled`.
+| Reason you see | What to do |
+|---|---|
+| Invalid signature | The website has an old Okta certificate. Redeploy so it downloads metadata again. This happens after Okta rolls its signing certificate. |
+| Audience | The Audience URI in Okta and the entity ID in the log differ by a character. Compare them in Notepad. |
+| Time, `NotBefore`, or `NotOnOrAfter` | The message is outside the allowed window. The website allows 60 seconds of clock difference. |
 
-**Users never appear in `/admin`.**
+### The website says Access denied (403) after Okta accepted you
 
-- **Provisioning > To App > Create Users** is on.
-- The user or group is on **Assignments**.
-- The push row in Okta has no error. Okta's error text is the SCIM `detail` (for example `userName is required` or `User already exists`).
-- You redeployed. The disk was wiped. Re-save provisioning or reassign so Okta pushes again.
+The sign-in message was valid, and `REQUIRE_SCIM_USER` is on.
 
-**409 User already exists.** A user with that `userName` is already in `db.json`. Okta is retrying a create. Deactivate/reactivate from Okta, or delete `db.json` by redeploying and let Okta create again. Don't keep two Okta apps pointed at one token and one store unless the usernames are disjoint.
+| Text on the page | What to do |
+|---|---|
+| User has not been provisioned via SCIM | Admin → SCIM users does not list this username. In Okta, assign the person, turn on **Create Users**, and wait for a `POST /Users` in the SCIM request log. The Okta username and the synced `userName` must be the same address. |
+| User is deactivated in SCIM | The user is listed as inactive. Reassign them or reactivate them in Okta so Okta sends an update that sets them active. |
 
-**Group push succeeds but member count stays 0.** Members who are not SCIM users yet are still stored as member ids when Okta sends them. If the count is 0, the push did not include members. Assign those people to the app so user provisioning runs, then push the group again.
+### You signed in, but Okta did not ask for the security key
 
-**Import from Okta is empty.** Expected on a new deploy. This app starts with no users. Push from Okta; don't import.
+Okta reused a session from earlier. Deploy with the ask-again setting and use a private window:
 
-## Lightsail deploy script
+```bash
+SAML_FORCE_AUTHN=true ./deploy/lightsail.sh
+```
 
-**`lightsailctl: command not found` or push fails immediately.** Install the plugin from the AWS Lightsail docs and put it on `PATH`. The AWS CLI does not include it.
+Then open `https://your-website/login`. Also confirm the app's **Sign On** tab uses the policy you edited, and that the strict rule is above any rule that allows a password alone.
 
-**`Could not determine pushed image name`.** The push command's output did not contain `":okta-test-app.app.<n>"`. Read the push output above that line. The usual cause is a failed upload or a `SERVICE_NAME` that does not match the service.
+The dashboard icon does not send the ask-again flag. Sign out of Okta before testing the icon.
 
-**Service stays in `PENDING` or `DEPLOYING`.** First-time container services often take several minutes. Keep polling `get-container-services`. A deployment that never reaches `RUNNING` is in the deployment record in the Lightsail console, usually a failed health check. `/healthz` failing means the process did not stay up; read `get-container-log`.
+### The home page says PasswordProtectedTransport after you used a security key
 
-**Docker build fails on Apple silicon.** The script targets `linux/amd64`. Start Docker Desktop and retry. You do not need a native arm64 image; Lightsail runs amd64.
+That is the value Okta puts in **AuthnContextClassRef** for a normal org. It does not tell you the factor. Read the `amr` row under Attribute statements. If that row is missing, add the attribute in [Integrate with Okta](okta.md) (`amr` = `session.amr`) and sign in again. The System Log in Okta is the authoritative record.
 
-## ECS
+### Admin says Forbidden
 
-**Target group flips between healthy and unhealthy, or login only works sometimes.** Desired count is above 1, or a deploy is running two tasks. Set desired count to 1. Each task has its own memory session store and its own disk.
+`ADMIN_USERS` is set, and this person's username is not on the list. The home page can still work. Either sign in as someone on the list, or deploy again with the right addresses:
 
-**Task is healthy and `"saml":false`.** The task definition revision that is running does not have `SAML_IDP_METADATA_URL`, or the private subnet has no NAT path to Okta. Exec into the logging story: the `[saml]` line says which.
+```bash
+ADMIN_USERS="you@example.com" ./deploy/lightsail.sh
+```
 
-**Cookies don't stick.** `BASE_URL` must start with `https://`. The ALB listener that users hit must be HTTPS. The HTTP listener should redirect, not serve the app.
+### The Okta icon lands on the home page and says IdP-initiated
 
-## Still stuck
+That is the correct result for the dashboard icon. SP-initiated appears when you start at `/login`.
 
-Collect three things: the `/healthz` JSON, the `[saml]` and `[app]` lines from startup, and the text of the 401/403 page or the Okta System Log event. Those distinguish "Okta never called us", "we rejected the assertion", and "we rejected the user after a good assertion".
+## Okta's connector test and user list
+
+### Test Connector Configuration fails
+
+1. SCIM connector base URL is `https://` plus the website host plus `/scim/v2`.
+2. Authentication Mode is **HTTP Header**.
+3. Authorization is the token only. Open `.deploy.env` with `notepad .deploy.env` and copy the characters after `SCIM_TOKEN=`. No word `Bearer`, no quotes, no space.
+4. `/healthz` opens in your browser. Okta's servers must be able to reach that same public address. A Lightsail address is public. An ECS load balancer that only allows your office IP will fail Okta's test even though your browser works.
+5. If the website log shows SCIM 503, the running container has no token. Redeploy so `.deploy.env`'s `SCIM_TOKEN` is sent.
+
+### Nobody appears under SCIM users
+
+1. **Provisioning → To App → Create Users** is on.
+2. The person is on the **Assignments** tab.
+3. The assignment row in Okta has no red error. The error text is the website's reason, such as "userName is required" or "User already exists".
+4. You deployed again after the push. That clears the file. Reassign the person or click **Save** on **To App** so Okta creates the user again.
+
+### Okta says the user already exists (409)
+
+The website already has that username. Okta is trying to create them a second time. Deactivate and reactivate the assignment in Okta, or redeploy to wipe the file and let Okta create them once. Point only one Okta app at a given website and token.
+
+### The group pushed, and the member count is 0
+
+Assign those people to the app so **Create Users** runs, then push the group again.
+
+### Import in Okta shows no users
+
+Expected on a new website. The file starts empty. Push from Okta to the website. Import would copy from the website into Okta, and there is nothing to copy yet.
+
+## The deploy script on Windows
+
+| What you see | What to do |
+|---|---|
+| `./deploy/lightsail.sh`: no such file | Git Bash is not in the project folder. `ls` should show `deploy` and `README.md`. |
+| PowerShell rejects the `SAML_IDP_METADATA_URL=...` command | That line is Bash. Right-click the project folder and choose **Git Bash Here**. Run the deploy script there. |
+| `docker` cannot connect | Start Docker Desktop. Wait until it says it is running. |
+| `aws`, `node`, or `lightsailctl` is not recognized inside Git Bash | Install that tool, then close Git Bash and open it again. Check `aws --version`, `node --version`, and `lightsailctl` in the new window. |
+| `Could not determine pushed image name` | The upload failed. Read the lines just above. Docker must be running and `lightsailctl` must be on PATH. |
+| `AccessDenied` | The IAM user cannot call Lightsail. The message names the missing permission. |
+
+`[config] SESSION_SECRET not set` in the website log means the container started without the secret from `.deploy.env`. Open that file, confirm the line is present, and run `./deploy/lightsail.sh` again with no extra arguments so it sends the saved values.
+
+## ECS only
+
+**The site works, then fails, then works.** The service is running more than one copy, or a deploy is mid-switch. Set the desired count to 1. Each copy has its own user file and its own cookies.
+
+**The target is healthy and `/healthz` says `"saml":false`.** The running task definition has no `SAML_IDP_METADATA_URL`, or the task's subnet cannot open HTTPS to Okta. The log line `[saml]` says which.
+
+**You sign in and the next click sends you back to the sign-in page.** `BASE_URL` has to start with `https://`. People must hit the load balancer's HTTPS listener. The HTTP listener should redirect to HTTPS.
+
+## What to send if you are still stuck
+
+Send these three things:
+
+1. The exact text of `/healthz`.
+2. The `[saml]` and `[app]` lines from the log.
+3. Either the error page from the website, or a screenshot of the Okta System Log event.
+
+Those separate "Okta never called the website", "the website rejected the sign-in message", and "the website rejected the person after a good message".

@@ -1,98 +1,108 @@
 # Architecture
 
-Okta Test App is a single Node.js process. It accepts SAML 2.0 logins from Okta and SCIM 2.0 provisioning pushes from Okta, then shows you what arrived. It does not implement its own passwords, MFA, or user directory beyond the records Okta pushes.
+Read [the README](../README.md) first. It explains what the website is for and how a sign-in moves between the browser, Okta, and this app. This page is the same system in more detail.
 
-```
-Browser                Okta                      This app
-  |                      |                          |
-  |--- GET /login ------>|                          |
-  |                      |<---- AuthnRequest -------|  SP-initiated
-  |--- sign in at Okta ->|                          |
-  |<----- SAMLResponse (HTTP POST) ---------------->|  /saml/acs
-  |                      |                          |
-  |                      |--- SCIM /Users, /Groups ->|  bearer token
-  |                      |                          |
-  |--- GET / and /admin --------------------------->|  session cookie
-```
+## One program, two jobs
 
-IdP-initiated login skips `/login`. The user clicks the app tile in the Okta dashboard, and Okta POSTs the assertion straight to `/saml/acs`.
+The website is one Node.js program. It does two jobs for Okta and nothing else.
 
-## Process layout
+**Sign-in.** Okta checks the person. Okta's signed message comes back through the browser to the page `/saml/acs`. The program checks the signature, checks that the message names this website, checks the time, and then shows the contents. The program does not ask for a password.
+
+**User sync.** Okta's servers call `/scim/v2` directly, with a bearer token, to create and update users and groups. The browser is not involved.
+
+Those two jobs share one data file. They do not share a login. A person can be synced and still fail sign-in at Okta. A person can pass Okta and still be rejected by the website if you turned on "only synced users may sign in".
+
+## The pages
+
+| Path | Who calls it | What the program does |
+|---|---|---|
+| `/` | The browser | Shows the sign-in button, or the last accepted Okta message |
+| `/login` | The browser | Sends the browser to Okta to start a sign-in |
+| `/saml/acs` | The browser, carrying Okta's message | Checks the message and starts a session |
+| `/saml/metadata` | You, or anyone | Returns this website's SAML name and ACS address as XML |
+| `/logout` | The browser | Deletes the website session. Okta stays signed in |
+| `/admin` | The browser, after a sign-in | Shows the log, users, and groups |
+| `/scim/v2/...` | Okta's servers | Creates and updates users and groups |
+| `/healthz` | AWS, and you | Returns `ok` and whether Okta's metadata loaded |
+
+`/healthz` returns HTTP 200 even when Okta's metadata failed to load. AWS will keep the copy in service. Read the `saml` field. `true` means the metadata loaded. `false` means the process is up and Okta is not connected.
+
+## What happens on startup
+
+The program starts inside the container and reads its settings from environment variables. [Configuration](configuration.md) lists them.
+
+If `SAML_IDP_METADATA_URL` is set, the program downloads that address once. From the XML it keeps:
+
+- Okta's issuer name
+- The sign-in URL it should send browsers to
+- Okta's signing certificates
+
+If that download fails, or the URL was never set, sign-in stays off. The process keeps running. `/login` shows **SAML not configured**. Fix the URL and start the process again. The program does not poll Okta for a new certificate later. A new deploy is how you pick up a change.
+
+## What the program checks on a sign-in message
+
+- The message is signed with a certificate it loaded from Okta.
+- The audience in the message equals this website's entity ID, which is the public address plus `/saml/metadata`.
+- The message was delivered to the ACS address, the public address plus `/saml/acs`.
+- The time window in the message is valid, with 60 seconds of slack for clock differences.
+
+A sign-in that started from the Okta dashboard is accepted. The program does not require the message to be a reply to a request it just sent.
+
+`/login` marks its request so that, after success, the browser returns to the page the person wanted (usually the home page, or `/admin` if they clicked Admin while signed out). A sign-in from the Okta icon lands on the home page.
+
+If `REQUIRE_SCIM_USER` is on, a message that passed every check above is still rejected unless the username in the message matches an **active** user in the data file.
+
+`/logout` deletes the cookie for this website. The next `/login` will skip Okta's prompt if Okta still has a session, unless `SAML_FORCE_AUTHN` is on. That setting tells Okta to run the authentication policy again.
+
+The program does not sign its own login request and does not publish a signing certificate. In the Okta SAML form, leave "signed requests" off.
+
+## What user sync accepts
+
+Every SCIM call must send `Authorization: Bearer` plus the token in `SCIM_TOKEN`. With no token configured, every SCIM call returns 503.
+
+Okta uses these operations, and the program implements them:
+
+| Address | Operations |
+|---|---|
+| `/ServiceProviderConfig` and `/ResourceTypes` | Read. This is what **Test Connector Configuration** calls. |
+| `/Users` | List, search, create |
+| `/Users/(id)` | Read, replace, partial update, delete |
+| `/Groups` | List, search, create |
+| `/Groups/(id)` | Read, replace, partial update, delete |
+
+Search is one equality check, such as username equals `someone@example.com`, and it ignores capitalization. That is the search Okta sends. Other search syntax gets a 400.
+
+Usernames must be unique, ignoring capitalization. Creating the same username twice returns 409.
+
+Extra fields Okta sends on a user are stored and shown back. Password changes are refused. This website never stores the Okta password.
+
+## The session and the Admin page
+
+A successful sign-in replaces any old session and stores the username, the issuer, the time Okta authenticated the person, the attribute fields, the raw XML, which path was used (website or Okta icon), and whether a synced user matched.
+
+The cookie name is `okta_test_sid`. It is HTTP-only, lasts 8 hours, and is marked Secure when the public address starts with `https://`.
+
+`/admin` requires that cookie. If `ADMIN_USERS` is set, the username or the email attribute must be on that list. An empty list means every signed-in person can open Admin.
+
+The Admin page shows the last 50 sign-ins and the last 50 SCIM calls. The file keeps 200 of each.
+
+## Where the data lives
+
+`db.json` is written under `DATA_DIR`. In the container that directory is `/data`. Nothing copies that file anywhere else. Replacing the container, which every Lightsail deploy does, starts from an empty file.
+
+Run one copy. Two copies would each have their own users and their own sessions.
+
+## The files
 
 | File | Role |
 |---|---|
-| `src/server.js` | HTTP routes, session cookie, admin gate, startup |
-| `src/saml.js` | Load Okta metadata, validate the POST, read the assertion |
-| `src/scim.js` | SCIM 2.0 `/Users` and `/Groups` |
-| `src/store.js` | JSON file under `DATA_DIR` (`db.json`) |
+| `src/server.js` | Routes, the session cookie, who may open Admin |
+| `src/saml.js` | Load Okta metadata, check the sign-in message, read the fields |
+| `src/scim.js` | The `/scim/v2` user and group API |
+| `src/store.js` | Read and write `db.json` |
 | `src/config.js` | Environment variables |
-| `src/views.js` | HTML for `/`, `/admin`, and error pages |
-| `deploy/lightsail.sh` | Build the image and deploy a Lightsail container service |
-| `Dockerfile` | Production image: Node 24, listens on 8080, runs as `node` |
+| `src/views.js` | HTML |
+| `deploy/lightsail.sh` | Build the container and publish it to Lightsail |
+| `Dockerfile` | Node 24, listens on 8080, health check hits `/healthz` |
 
-`node-saml` validates signatures, audience, recipient, and time window. Express serves the pages. `express-session` keeps the signed-in user in a cookie named `okta_test_sid`.
-
-## SAML
-
-On startup the app loads the identity provider once:
-
-1. If `SAML_IDP_METADATA_URL` is set, it fetches that URL and reads the entity ID, HTTP-Redirect SSO URL (falling back to the first SSO URL), and signing certificates.
-2. Otherwise it uses `SAML_IDP_SSO_URL` plus `SAML_IDP_CERT` (and `SAML_IDP_ISSUER` when set).
-
-A failed fetch or a missing configuration leaves SAML disabled. The process still listens. `/healthz` returns `"saml": false`, and `/login` returns 503. Restart the process after fixing the configuration. Metadata is not refreshed in the background, so an Okta certificate rotation needs a restart.
-
-Validation settings that matter for Okta:
-
-- The assertion must be signed (`SAML_WANT_ASSERTIONS_SIGNED` defaults to true).
-- The outer response signature is optional (`SAML_WANT_RESPONSE_SIGNED` defaults to false). Okta signs the response as well, and you can require it.
-- `InResponseTo` is not checked, so a login that started at the Okta dashboard is accepted.
-- Clock skew allowance is 60 seconds.
-- The audience and the ACS URL both come from `BASE_URL` unless `SAML_SP_ENTITY_ID` overrides the audience.
-
-`/login` sends `RelayState` of `sp:<path>`. After a successful POST, a relay value with that prefix is an SP-initiated login and the user is sent to that path. Any other relay value, including an empty one, is treated as IdP-initiated and the user lands on `/`.
-
-When `REQUIRE_SCIM_USER=true`, a valid assertion is still rejected unless `NameID` or the `email` attribute matches an **active** SCIM `userName`.
-
-`/logout` deletes the app session only. The Okta session stays in the browser. Set `SAML_FORCE_AUTHN=true` when you need Okta to run the authentication policy again on the next `/login`.
-
-The app does not sign authentication requests and does not publish a signing certificate in its metadata. Leave Okta's "signed requests" requirement off.
-
-## SCIM
-
-`/scim/v2` is mounted before the session middleware. Callers authenticate with `Authorization: Bearer <SCIM_TOKEN>`. The comparison is constant-time. With no token configured, every SCIM call returns 503.
-
-Supported operations match what Okta's SCIM connector sends:
-
-| Resource | Operations |
-|---|---|
-| `/ServiceProviderConfig`, `/ResourceTypes` | GET |
-| `/Users` | GET (filter, pagination), POST |
-| `/Users/:id` | GET, PUT, PATCH, DELETE |
-| `/Groups` | GET (filter, `excludedAttributes=members`), POST |
-| `/Groups/:id` | GET, PUT, PATCH, DELETE |
-
-Filters are a single `attr eq "value"` comparison, case-insensitive. That covers Okta's `userName eq "..."` lookup. Other filter syntax returns 400 `invalidFilter`.
-
-User PATCH accepts `add` and `replace`. Group PATCH accepts member `add`, `remove` (including `members[value eq "..."]`), and `replace`. Extra user attributes Okta sends, including enterprise extension URNs, are stored and returned.
-
-`userName` is unique, compared case-insensitively. A second POST for the same username returns 409.
-
-## Sessions and the admin console
-
-A successful ACS call regenerates the session and stores NameID, NameID format, issuer, session index, `AuthnContextClassRef`, `AuthnInstant`, attribute statements, the raw assertion XML, which flow was used, and whether a SCIM user matched.
-
-The cookie is `HttpOnly`, `SameSite=Lax`, and `Secure` when `BASE_URL` starts with `https://`. Lifetime is 8 hours.
-
-`/admin` requires a session. If `ADMIN_USERS` is set, `NameID` or the `email` attribute must be in that list (case-insensitive). An empty list means every signed-in user can open `/admin`.
-
-The admin page reads the JSON store: the last 50 sign-in attempts (the file keeps 200), SCIM users, SCIM groups, and the last 50 SCIM requests.
-
-## Data
-
-`src/store.js` writes `DATA_DIR/db.json`. The container image sets `DATA_DIR=/data`. Nothing replicates that file. Two copies of the process would each have their own users, sessions, and logs. Run one task, and expect the file to disappear when the container is replaced.
-
-## Health
-
-`GET /healthz` returns `{"ok":true,"saml":true}` or `{"ok":true,"saml":false}`. The HTTP status is 200 in both cases, so a load balancer will keep a task in service even when SAML failed to initialize. Check the `saml` field, or the log line `[saml] ready`, before testing login.
-
-The app sets `trust proxy`, so it is meant to sit behind Lightsail's proxy or an ALB that sets `X-Forwarded-*`.
+The program trusts the proxy in front of it (Lightsail, or a load balancer on ECS) to tell it the original `https://` address.
